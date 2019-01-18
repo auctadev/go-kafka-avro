@@ -2,6 +2,7 @@ package kafka
 
 import (
 	"encoding/binary"
+	"fmt"
 	"github.com/Shopify/sarama"
 	"github.com/bsm/sarama-cluster"
 	"github.com/linkedin/goavro"
@@ -9,15 +10,16 @@ import (
 	"os/signal"
 )
 
-type avroConsumer struct {
+type AvroConsumer struct {
 	Consumer             *cluster.Consumer
 	SchemaRegistryClient *CachedSchemaRegistryClient
 	callbacks            ConsumerCallbacks
 }
 
 type ConsumerCallbacks struct {
-	OnDataReceived func(msg Message)
+	OnDataReceived func(msg *Message) bool
 	OnError        func(err error)
+	OnCommitFailed func(msg *Message, err error)
 	OnNotification func(notification *cluster.Notification)
 }
 
@@ -30,15 +32,27 @@ type Message struct {
 	Value     string
 }
 
+const (
+	COMMIT_ERROR_CTX = "commit"
+)
+
 // avroConsumer is a basic consumer to interact with schema registry, avro and kafka
 func NewAvroConsumer(kafkaServers []string, schemaRegistryServers []string,
-	topic string, groupId string, callbacks ConsumerCallbacks) (*avroConsumer, error) {
-	// init (custom) config, enable errors and notifications
-	config := cluster.NewConfig()
-	config.Consumer.Return.Errors = true
-	config.Group.Return.Notifications = true
-	//read from beginning at the first time
-	config.Consumer.Offsets.Initial = sarama.OffsetOldest
+	topic string, groupId string, callbacks ConsumerCallbacks) (*AvroConsumer, error) {
+	return NewAvroConsumerCustomConfig(kafkaServers, schemaRegistryServers, topic, groupId, callbacks, nil)
+}
+
+func NewAvroConsumerCustomConfig(kafkaServers []string, schemaRegistryServers []string,
+	topic string, groupId string, callbacks ConsumerCallbacks, config *cluster.Config) (*AvroConsumer, error) {
+	if config == nil {
+		// init (custom) config, enable errors and notifications
+		config = cluster.NewConfig()
+		//read from beginning at the first time
+		config.Consumer.Offsets.Initial = sarama.OffsetOldest
+		config.Consumer.Return.Errors = true
+		config.Group.Return.Notifications = true
+	}
+
 	topics := []string{topic}
 	consumer, err := cluster.NewConsumer(kafkaServers, groupId, topics, config)
 	if err != nil {
@@ -46,7 +60,7 @@ func NewAvroConsumer(kafkaServers []string, schemaRegistryServers []string,
 	}
 
 	schemaRegistryClient := NewCachedSchemaRegistryClient(schemaRegistryServers)
-	return &avroConsumer{
+	return &AvroConsumer{
 		consumer,
 		schemaRegistryClient,
 		callbacks,
@@ -54,7 +68,7 @@ func NewAvroConsumer(kafkaServers []string, schemaRegistryServers []string,
 }
 
 //GetSchemaId get schema id from schema-registry service
-func (ac *avroConsumer) GetSchema(id int) (*goavro.Codec, error) {
+func (ac *AvroConsumer) GetSchema(id int) (*goavro.Codec, error) {
 	codec, err := ac.SchemaRegistryClient.GetSchema(id)
 	if err != nil {
 		return nil, err
@@ -62,15 +76,30 @@ func (ac *avroConsumer) GetSchema(id int) (*goavro.Codec, error) {
 	return codec, nil
 }
 
-func (ac *avroConsumer) Consume() {
+func (ac *AvroConsumer) Consume() error {
 	// trap SIGINT to trigger a shutdown.
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt)
+
+	// current managed message
+	currentMsgChan := make(chan *Message, 1)
 
 	// consume errors
 	go func() {
 		for err := range ac.Consumer.Errors() {
 			if ac.callbacks.OnError != nil {
+				if clusterErr, ok := err.(*cluster.Error); ok {
+					switch clusterErr.Ctx {
+					case COMMIT_ERROR_CTX:
+						var msg *Message
+						select {
+						case msg = <-currentMsgChan:
+						default:
+							msg = nil
+						}
+						ac.callbacks.OnCommitFailed(msg, err)
+					}
+				}
 				ac.callbacks.OnError(err)
 			}
 		}
@@ -92,19 +121,30 @@ func (ac *avroConsumer) Consume() {
 				msg, err := ac.ProcessAvroMsg(m)
 				if err != nil {
 					ac.callbacks.OnError(err)
-				}
-				ac.Consumer.MarkOffset(m, "")
-				if ac.callbacks.OnDataReceived != nil {
-					ac.callbacks.OnDataReceived(msg)
+				} else {
+					currentMsgChan = make(chan *Message, 1)
+					currentMsgChan <- &msg
+					markOffset := true
+					if ac.callbacks.OnDataReceived != nil {
+						if !ac.callbacks.OnDataReceived(&msg) {
+							fmt.Printf("Failed to manage consumed message with offset [%+v] on partition [%d] for topic [%s]. Skipping offset commit", m.Offset, m.Partition, m.Topic)
+							markOffset = false
+						}
+					}
+					if markOffset {
+						ac.Consumer.MarkOffset(m, "")
+					}
 				}
 			}
 		case <-signals:
-			return
+			return nil
 		}
 	}
+
+	return nil
 }
 
-func (ac *avroConsumer) ProcessAvroMsg(m *sarama.ConsumerMessage) (Message, error) {
+func (ac *AvroConsumer) ProcessAvroMsg(m *sarama.ConsumerMessage) (Message, error) {
 	schemaId := binary.BigEndian.Uint32(m.Value[1:5])
 	codec, err := ac.GetSchema(int(schemaId))
 	if err != nil {
@@ -126,6 +166,6 @@ func (ac *avroConsumer) ProcessAvroMsg(m *sarama.ConsumerMessage) (Message, erro
 	return msg, nil
 }
 
-func (ac *avroConsumer) Close() {
+func (ac *AvroConsumer) Close() {
 	ac.Consumer.Close()
 }

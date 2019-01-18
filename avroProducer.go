@@ -13,10 +13,16 @@ type AvroProducer struct {
 
 // NewAvroProducer is a basic producer to interact with schema registry, avro and kafka
 func NewAvroProducer(kafkaServers []string, schemaRegistryServers []string) (*AvroProducer, error) {
-	config := sarama.NewConfig()
-	config.Producer.Partitioner = sarama.NewRandomPartitioner
-	config.Producer.Return.Successes = true
-	config.Producer.RequiredAcks = sarama.WaitForAll
+	return NewAvroProducerCustomConfig(kafkaServers, schemaRegistryServers, nil)
+}
+
+func NewAvroProducerCustomConfig(kafkaServers []string, schemaRegistryServers []string, config *sarama.Config) (*AvroProducer, error) {
+	if config == nil {
+		config = sarama.NewConfig()
+		config.Producer.Partitioner = sarama.NewRandomPartitioner
+		config.Producer.Return.Successes = true
+		config.Producer.RequiredAcks = sarama.WaitForAll
+	}
 	producer, err := sarama.NewSyncProducer(kafkaServers, config)
 	if err != nil {
 		return nil, err
