@@ -41,23 +41,28 @@ func (ap *AvroProducer) GetSchemaId(topic string, avroCodec *goavro.Codec) (int,
 }
 
 func (ap *AvroProducer) Add(topic string, schema string, key []byte, value []byte) error {
+	_, _, err := ap.AddWithResponse(topic, schema, key, value)
+	return err
+}
+
+func (ap *AvroProducer) AddWithResponse(topic string, schema string, key []byte, value []byte) (int32, int64, error) {
 	avroCodec, err := goavro.NewCodec(schema)
 	schemaId, err := ap.GetSchemaId(topic, avroCodec)
 	if err != nil {
-		return err
+		return -1, -1, err
 	}
 	binarySchemaId := make([]byte, 4)
 	binary.BigEndian.PutUint32(binarySchemaId, uint32(schemaId))
 
 	native, _, err := avroCodec.NativeFromTextual(value)
 	if err != nil {
-		return err
+		return -1, -1, err
 	}
 
 	// Convert native Go form to binary Avro data
 	binaryValue, err := avroCodec.BinaryFromNative(nil, native)
 	if err != nil {
-		return err
+		return -1, -1, err
 	}
 
 	var binaryMsg []byte
@@ -73,8 +78,7 @@ func (ap *AvroProducer) Add(topic string, schema string, key []byte, value []byt
 		Key:   sarama.StringEncoder(key),
 		Value: sarama.StringEncoder(binaryMsg),
 	}
-	_, _, err = ap.producer.SendMessage(msg)
-	return err
+	return ap.producer.SendMessage(msg)
 }
 
 func (ac *AvroProducer) Close() {
